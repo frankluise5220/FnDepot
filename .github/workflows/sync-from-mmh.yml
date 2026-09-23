@@ -1,0 +1,72 @@
+name: Sync from MMH
+
+on:
+  schedule:
+    # Hourly at :10; the FnDepot robot reads this repo at 00:00 UTC+8 daily,
+    # so hourly mirroring keeps the published index well ahead of that.
+    - cron: "10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Mirror fnpack.json from frankluise5220/MMH main
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Fetch and compare source index
+        id: sync
+        env:
+          UPSTREAM_URL: https://raw.githubusercontent.com/frankluise5220/MMH/main/deploy/fnos/repository/fnpack.json
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if curl -fsSL --retry 2 -o /tmp/fnpack.json "$UPSTREAM_URL"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Failed to fetch fnpack.json from MMH main."
+              exit 1
+            fi
+            sleep 15
+          done
+
+          python3 - <<'PY'
+          import json
+          with open("/tmp/fnpack.json", encoding="utf-8") as f:
+              source = json.load(f)
+          assert source.get("schema_version") == "2", "schema_version must be string '2'"
+          info = source.get("source_info") or {}
+          assert info.get("name") and info.get("author"), "source_info incomplete"
+          apps = source.get("apps") or {}
+          assert apps, "apps must not be empty"
+          for name, app in apps.items():
+              assert app.get("releases"), f"{name}: no releases"
+              for version, release in app["releases"].items():
+                  packages = release.get("packages") or {}
+                  for arch, branch in packages.items():
+                      assert branch.get("download_url"), f"{name}@{version}/{arch}: missing download_url"
+          print("Upstream source index passed basic V2 checks.")
+          PY
+
+          if [ -f fnpack.json ] && cmp -s fnpack.json /tmp/fnpack.json; then
+            echo "fnpack.json identical to upstream; nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            cp /tmp/fnpack.json fnpack.json
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit updated source index
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add fnpack.json
+          git commit -m "sync: mirror fnpack.json from MMH main"
+          git push origin main
